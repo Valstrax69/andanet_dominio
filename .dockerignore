@@ -1,0 +1,6 @@
+tests/
+*.md
+.github/
+__pycache__/
+*.pyc
+requirements-dev.txt
