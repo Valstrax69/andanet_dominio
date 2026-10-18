@@ -22,6 +22,7 @@ from app.plantillas import buscar_respuesta, DERIVACION, PLANTILLAS
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gateway:8080")
 TIMEOUT_IA = float(os.getenv("TIMEOUT_IA", "3"))
 INTENCIONES_QUE_DERIVAN = {"anulacion"}   # el bot no cancela servicios (DA3)
+UMBRAL_CONFIANZA = float(os.getenv("UMBRAL_CONFIANZA", "0.55"))
 
 RE_HUMANO = re.compile(r"\b(ejecutivo|persona|humano|agente|operador|alguien real)\b", re.IGNORECASE)
 
@@ -83,11 +84,18 @@ def chat(m: Mensaje):
                 "modelo_version": None}
 
     intencion = pred.get("intencion", "otra")
-    derivar = intencion in INTENCIONES_QUE_DERIVAN
+    confianza = pred.get("confianza") or 0.0
+
+    # 3. Se deriva por tres motivos: anulacion (DA3), el modelo no esta seguro,
+    #    o no reconocio la intencion. Preferimos derivar antes que responder mal.
+    poco_seguro = confianza < UMBRAL_CONFIANZA
+    derivar = intencion in INTENCIONES_QUE_DERIVAN or poco_seguro or intencion == "otra"
     guardar_prediccion(pred, derivar)
 
-    if derivar:
+    if intencion in INTENCIONES_QUE_DERIVAN:
         respuesta = PLANTILLAS["anulacion"]
+    elif derivar:
+        respuesta = DERIVACION
     else:
         with conectar() as conn:
             respuesta = buscar_respuesta(conn, intencion)
