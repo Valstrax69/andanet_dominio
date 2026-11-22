@@ -4,12 +4,14 @@ from app.main import app, quiere_humano
 from app.plantillas import PLANTILLAS
 
 client = TestClient(app)
+# Desde EP3 la API publica exige clave; conftest.py registra esta como valida
+CLAVE = {"X-API-Key": "clave-de-prueba"}
 INTENCIONES = {"facturacion", "falla_conexion", "cambio_plan", "visita", "anulacion", "otra"}
 
 
 def test_deriva_cuando_pide_humano():
     # No toca base ni IA: el pedido de humano se resuelve de inmediato (RNF11)
-    r = client.post("/api/chat", json={"texto": "quiero hablar con una persona"})
+    r = client.post("/api/chat", json={"texto": "quiero hablar con una persona"}, headers=CLAVE)
     assert r.status_code == 200
     cuerpo = r.json()
     assert cuerpo["derivar"] is True
@@ -28,5 +30,5 @@ def test_plantillas_cubren_todas_las_intenciones():
 
 
 def test_rechaza_texto_vacio():
-    r = client.post("/api/chat", json={"texto": ""})
+    r = client.post("/api/chat", json={"texto": ""}, headers=CLAVE)
     assert r.status_code == 422
