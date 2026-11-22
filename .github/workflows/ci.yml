@@ -1,12 +1,13 @@
 name: ci-dominio
  
-# Construye y publica dos imagenes desde este repo: dominio (API) y carga (job).
+# Construye y publica tres imagenes desde este repo: dominio (API), carga (job)
+# y worker (consumidor de la cola del LLM, EP3).
 on:
   pull_request:
     branches: [dev, main]
   push:
     branches: [main]
-    tags: ["ep2"]
+    tags: ["ep2", "ep3"]
  
 jobs:
   build:
@@ -21,6 +22,8 @@ jobs:
             dockerfile: Dockerfile
           - imagen: carga
             dockerfile: carga.Dockerfile
+          - imagen: worker
+            dockerfile: worker.Dockerfile
     steps:
       - uses: actions/checkout@v4
  

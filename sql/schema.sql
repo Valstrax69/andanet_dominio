@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS predicciones (
     derivada       BOOLEAN DEFAULT FALSE,
     respuesta_llm  TEXT,             -- lo que redacto el LLM, cuando llega
     estado_llm     TEXT DEFAULT 'pendiente',
+    motivo_llm     TEXT,             -- por que no hay texto, cuando quedo degradado
+    latencia_llm_ms INTEGER,
     creado_en      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -55,6 +57,8 @@ CREATE TABLE IF NOT EXISTS predicciones (
 -- se vuelve a crear, asi que las columnas nuevas se agregan aparte.
 ALTER TABLE predicciones ADD COLUMN IF NOT EXISTS respuesta_llm TEXT;
 ALTER TABLE predicciones ADD COLUMN IF NOT EXISTS estado_llm TEXT DEFAULT 'pendiente';
+ALTER TABLE predicciones ADD COLUMN IF NOT EXISTS motivo_llm TEXT;
+ALTER TABLE predicciones ADD COLUMN IF NOT EXISTS latencia_llm_ms INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_tickets_cliente ON tickets (cliente_id);
 CREATE INDEX IF NOT EXISTS idx_faq_intencion ON faq (intencion);

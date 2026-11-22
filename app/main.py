@@ -4,8 +4,9 @@ Microservicio de dominio - logica del asistente ANDA.
   GET  /health                  estado del servicio, de la base y de la cola
   POST /api/chat                el endpoint que usa el front
   POST /api/predict             el mismo, con el nombre que pide el enunciado
-  GET  /api/respuesta/{id}      el texto que redacto el LLM, cuando ya llego
-  PUT  /interno/respuesta/{id}  lo llama el worker; no se publica a internet
+  GET  /api/respuesta/{id}                el texto del LLM, cuando ya llego
+  GET  /interno/predicciones/{id}/llm     el worker pregunta el estado
+  PUT  /interno/predicciones/{id}/llm     el worker entrega el texto
 
 Flujo de una consulta:
 
@@ -18,7 +19,7 @@ Flujo de una consulta:
      lo que mide el p95.
   5. Se publica en la cola un pedido para que el LLM redacte esa misma
      respuesta en lenguaje natural. El worker lo toma, llama a NVIDIA y
-     devuelve el texto por PUT /interno/respuesta/{id}.
+     devuelve el texto por PUT /interno/predicciones/{id}/llm.
 
 El paso 5 es un agregado: si NVIDIA falla, o la cola no esta, el cliente ya
 tiene su respuesta. Es lo que pide el enunciado cuando dice que la prediccion
@@ -27,6 +28,7 @@ tiene que seguir funcionando aunque NVIDIA falle.
 Lo que se publica en la cola es el texto YA enmascarado que devolvio el micro de
 IA, nunca el que escribio el cliente: ningun dato personal sale hacia NVIDIA.
 """
+import json
 import os
 import re
 
@@ -47,6 +49,17 @@ UMBRAL_CONFIANZA = float(os.getenv("UMBRAL_CONFIANZA", "0.55"))
 RE_HUMANO = re.compile(r"\b(ejecutivo|persona|humano|agente|operador|alguien real)\b",
                        re.IGNORECASE)
 
+# Lo que se le pide al LLM. Dos reglas importan y son las de ADR-3: que use SOLO
+# el articulo entregado, y que no invente montos, fechas ni plazos. Las cifras
+# del cliente no pasan por aqui: las pone la plantilla.
+INSTRUCCION_LLM = (
+    "Eres el asistente automatico de Andesnet, una empresa de telecomunicaciones chilena. "
+    "Redacta una respuesta cordial de maximo tres lineas para el cliente, en espanol de Chile, "
+    "usando SOLO la informacion del articulo entregado. Di que eres un asistente automatico. "
+    "No inventes montos, fechas, planes ni plazos, no prometas descuentos y no pidas datos "
+    "personales. Si el articulo no responde la consulta, ofrece derivar con un ejecutivo."
+)
+
 app = FastAPI(
     title="Andesnet - asistente ANDA",
     description="API del asistente de atencion. Requiere la cabecera X-API-Key.",
@@ -60,8 +73,11 @@ class Mensaje(BaseModel):
 
 
 class TextoLLM(BaseModel):
-    texto_llm: str = Field(default="", max_length=4000)
-    estado: str = Field(default="ok", max_length=40)
+    """Lo que entrega el worker: el texto, o el motivo por el que no hay texto."""
+    estado: str = Field(max_length=40, description='"listo" o "degradado"')
+    texto: str = Field(default="", max_length=4000)
+    motivo: str | None = Field(default=None, max_length=200)
+    latencia_ms: int | None = None
 
 
 def quiere_humano(texto):
@@ -108,15 +124,21 @@ def guardar_prediccion(pred, derivada, estado_llm):
 
 
 def pedir_texto_al_llm(id_prediccion, intencion, texto_enmascarado, articulo):
-    """Publica el pedido en la cola. Devuelve el estado que queda registrado."""
+    """Publica el pedido en la cola. Devuelve el estado que queda registrado.
+
+    El contenido viaja como JSON con el mensaje YA enmascarado por el micro de
+    IA y el articulo de la FAQ, que es publico. Ni la cola, ni el worker, ni
+    NVIDIA ven un dato personal.
+    """
     if not cola.configurada() or id_prediccion is None:
         return "no_configurado"
     try:
         cola.publicar({
-            "id": id_prediccion,
-            "intencion": intencion,
-            "mensaje": texto_enmascarado,   # ya enmascarado por el micro de IA
-            "articulo": articulo,
+            "id": str(id_prediccion),
+            "instruccion": INSTRUCCION_LLM,
+            "contenido": json.dumps({"mensaje": texto_enmascarado,
+                                     "intencion": intencion,
+                                     "articulo": articulo}, ensure_ascii=False),
         })
         return "pendiente"
     except Exception:
@@ -195,34 +217,52 @@ def _marcar_estado(id_prediccion, estado):
 @app.get("/api/respuesta/{id_prediccion}", dependencies=[Depends(requiere_clave)])
 def respuesta_llm(id_prediccion: int):
     """El front consulta aqui si ya llego el texto redactado por el LLM."""
-    try:
-        with conectar() as conn:
-            fila = conn.execute(
-                "SELECT intencion, respuesta_llm, estado_llm FROM predicciones WHERE id = %s",
-                (id_prediccion,)).fetchone()
-    except Exception:
-        raise HTTPException(status_code=503, detail="La base no esta disponible")
-    if fila is None:
-        raise HTTPException(status_code=404, detail="No existe esa consulta")
-    return {"id": id_prediccion, "intencion": fila[0],
-            "respuesta_llm": fila[1], "estado_llm": fila[2]}
+    fila = _leer(id_prediccion, "intencion, respuesta_llm, estado_llm, motivo_llm")
+    return {"id": id_prediccion, "intencion": fila[0], "respuesta_llm": fila[1],
+            "estado_llm": fila[2], "motivo_llm": fila[3]}
 
 
-@app.put("/interno/respuesta/{id_prediccion}")
-def guardar_texto_llm(id_prediccion: int, cuerpo: TextoLLM):
-    """Lo llama el worker cuando NVIDIA ya respondio.
+# --- Rutas internas: las usa el worker. No llevan clave porque no se publican a
+# --- internet; Caddy devuelve 404 para /interno/* desde fuera.
 
-    No lleva clave de API porque no se publica a internet: Caddy devuelve 404
-    para /interno/*, asi que solo se llega desde la red de Docker.
+@app.get("/interno/predicciones/{id_prediccion}/llm")
+def estado_llm_interno(id_prediccion: int):
+    """El worker pregunta el estado ANTES de llamar a NVIDIA.
+
+    Asi no se gasta una llamada dos veces: si el worker murio despues de
+    entregar y antes de confirmar el mensaje, RabbitMQ lo reparte otra vez y el
+    estado ya dice "listo".
     """
+    fila = _leer(id_prediccion, "estado_llm")
+    return {"id": id_prediccion, "estado": fila[0]}
+
+
+@app.put("/interno/predicciones/{id_prediccion}/llm")
+def guardar_texto_llm(id_prediccion: int, cuerpo: TextoLLM):
+    """Lo llama el worker cuando NVIDIA respondio, o cuando se rindio."""
     try:
         with conectar() as conn:
             filas = conn.execute(
-                "UPDATE predicciones SET respuesta_llm = %s, estado_llm = %s WHERE id = %s",
-                (cuerpo.texto_llm or None, cuerpo.estado, id_prediccion)).rowcount
+                "UPDATE predicciones SET respuesta_llm = %s, estado_llm = %s, "
+                "motivo_llm = %s, latencia_llm_ms = %s WHERE id = %s",
+                (cuerpo.texto or None, cuerpo.estado, cuerpo.motivo,
+                 cuerpo.latencia_ms, id_prediccion)).rowcount
             conn.commit()
     except Exception:
         raise HTTPException(status_code=503, detail="La base no esta disponible")
     if not filas:
         raise HTTPException(status_code=404, detail="No existe esa consulta")
     return {"id": id_prediccion, "estado_llm": cuerpo.estado}
+
+
+def _leer(id_prediccion, columnas):
+    try:
+        with conectar() as conn:
+            fila = conn.execute(
+                f"SELECT {columnas} FROM predicciones WHERE id = %s",
+                (id_prediccion,)).fetchone()
+    except Exception:
+        raise HTTPException(status_code=503, detail="La base no esta disponible")
+    if fila is None:
+        raise HTTPException(status_code=404, detail="No existe esa consulta")
+    return fila
