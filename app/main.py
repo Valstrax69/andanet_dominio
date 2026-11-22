@@ -87,13 +87,17 @@ def quiere_humano(texto):
 def pedir_intencion(texto):
     """Llama al micro de IA por el gateway, que reparte entre las dos replicas.
 
+    Va a /api/ia/predict y no a /api/predict: esa ultima es la ruta PUBLICA de
+    este mismo servicio, la que exige la clave. Caddy bloquea /api/ia/* desde
+    internet, asi que el clasificador solo se alcanza desde la red de Docker.
+
     Reintenta una vez para tolerar el corte breve cuando una replica se detiene
     (RNF4). El timeout por omision es 12 s porque en EP3 la IA puede estar
     esperando un arranque en frio de SageMaker, que se midio en unos 6 s.
     """
     for _ in range(2):
         try:
-            r = httpx.post(f"{GATEWAY_URL}/api/predict", json={"texto": texto},
+            r = httpx.post(f"{GATEWAY_URL}/api/ia/predict", json={"texto": texto},
                            timeout=TIMEOUT_IA)
             r.raise_for_status()
             return r.json()
